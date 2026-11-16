@@ -457,6 +457,7 @@ def get_all_users() -> list[dict]:
 def get_user_transactions(
     user_id: Any,
     limit: int = 10000,
+    include_all_operational: bool = False,
 ) -> list[dict]:
 
     collection = get_collection("synthetic_transactions")
@@ -476,7 +477,32 @@ def get_user_transactions(
         .limit(limit)
     )
 
-    return documents
+    # New, successfully processed demo payments can inform future behavior.
+    # Rejected and unverified attempts must not become the user's "normal".
+    if collection_exists("transactions"):
+        operational = list(
+            get_collection("transactions").find(query)
+            .sort("created_at", DESCENDING)
+            .limit(limit)
+        )
+        if not include_all_operational:
+            trusted_outcomes = {
+                "allow", "allowed", "monitor", "monitored", "completed", "success"
+            }
+            operational = [
+                tx for tx in operational
+                if normalize_text(first_value(tx, "status", "decision"))
+                in trusted_outcomes
+            ]
+        documents.extend(operational)
+
+    documents.sort(
+        key=lambda tx: parse_datetime(first_value(
+            tx, "transaction_time", "created_at", "time"
+        )) or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+    return documents[:limit]
 
 
 def get_all_historical_transactions(
@@ -616,14 +642,13 @@ def resolve_beneficiary(
 
     result = {
         "resolved": False,
-        "beneficiary_id": provided_beneficiary_id,
+        "beneficiary_id": None,
         "recipient_upi_id": recipient_upi_id,
         "document": None,
     }
 
-    if provided_beneficiary_id is not None:
-        result["resolved"] = True
-        return result
+    # The client cannot prove recipient trust by inventing an internal ID.
+    # A known beneficiary must be resolved from server-held records/history.
 
     if not recipient_upi_id:
         return result
@@ -2189,6 +2214,7 @@ def load_trained_model(path: str) -> dict:
         "positive_rows": artifact.get("train_positive_rows", 0),
         "validation_metrics": artifact.get("validation_metrics"),
         "test_metrics": artifact.get("test_metrics"),
+        "split_audit": artifact.get("split_audit"),
         "error": None,
     }
     return ML_METRICS
@@ -3724,6 +3750,7 @@ def user_transactions(
         for tx in get_user_transactions(
             user_id,
             limit,
+            include_all_operational=True,
         )
     ]
 

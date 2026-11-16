@@ -36,6 +36,8 @@ import {
 } from "lucide-react";
 
 import "./index.css";
+import { buildDemoScenario } from "./demoScenarios.js";
+import { formatMlProbability, presentFactors } from "./riskPresentation.js";
 
 const API = (
   import.meta.env.VITE_API_URL || "http://127.0.0.1:8000"
@@ -483,8 +485,17 @@ export default function App() {
   const [dashboard, setDashboard] =
     useState(null);
 
+  const [health, setHealth] =
+    useState(null);
+
+  const [profileState, setProfileState] =
+    useState({ userId: "", profile: null });
+
   const [form, setForm] =
     useState(initialForm);
+
+  const [activeScenario, setActiveScenario] =
+    useState("");
 
   const [result, setResult] =
     useState(null);
@@ -701,13 +712,23 @@ export default function App() {
     }
   }
 
+  async function loadBehaviourProfile(userId) {
+    try {
+      const data = await apiRequest(`/users/${encodeURIComponent(userId)}`);
+      setProfileState({ userId, profile: data?.behaviour_profile ?? null });
+    } catch {
+      setProfileState({ userId, profile: null });
+    }
+  }
+
   useEffect(() => {
     let active = true;
 
     Promise.allSettled([
       apiRequest("/users"),
       apiRequest("/soc/dashboard"),
-    ]).then(([usersResult, dashboardResult]) => {
+      apiRequest("/health"),
+    ]).then(([usersResult, dashboardResult, healthResult]) => {
       if (!active) return;
 
       if (usersResult.status === "fulfilled") {
@@ -730,11 +751,21 @@ export default function App() {
       if (dashboardResult.status === "fulfilled") {
         setDashboard(dashboardResult.value);
       }
+      if (healthResult.status === "fulfilled") {
+        setHealth(healthResult.value);
+      }
       setInitialLoading(false);
     });
 
+    const healthInterval = setInterval(() => {
+      apiRequest("/health")
+        .then((status) => { if (active) setHealth(status); })
+        .catch(() => { if (active) setHealth(null); });
+    }, 30000);
+
     return () => {
       active = false;
+      clearInterval(healthInterval);
       try {
         recognitionRef.current?.stop();
       } catch {
@@ -775,6 +806,24 @@ export default function App() {
     return () => { active = false; };
   }, [selectedUserId]);
 
+  useEffect(() => {
+    if (!selectedUserId) {
+      return;
+    }
+    let active = true;
+    apiRequest(`/users/${encodeURIComponent(selectedUserId)}`)
+      .then((data) => {
+        if (active) setProfileState({
+          userId: selectedUserId,
+          profile: data?.behaviour_profile ?? null,
+        });
+      })
+      .catch(() => {
+        if (active) setProfileState({ userId: selectedUserId, profile: null });
+      });
+    return () => { active = false; };
+  }, [selectedUserId]);
+
   /* =====================================================
      FORM
   ===================================================== */
@@ -783,6 +832,7 @@ export default function App() {
     field,
     value
   ) {
+    setActiveScenario("");
     setForm(
       (previous) => ({
         ...previous,
@@ -803,24 +853,23 @@ export default function App() {
     );
   }
 
-  /* =====================================================
-     BENEFICIARY INTERNAL ID
-     
-     User does NOT see this.
-     Backend schema requires beneficiary_id.
-  ===================================================== */
-
-  function buildInternalBeneficiaryId() {
-    const upi =
-      form.recipient_upi_id.trim();
-
-    if (!upi) {
-      return "AUTO-BENEFICIARY";
-    }
-
-    return `UPI-${upi
-      .replace(/[^a-zA-Z0-9]/g, "-")
-      .slice(0, 48)}`;
+  function applyScenario(kind) {
+    const behaviourProfile = profileState.userId === selectedUserId
+      ? profileState.profile
+      : null;
+    setForm(buildDemoScenario(
+      kind,
+      behaviourProfile,
+      transactions,
+      nowLocalInput()
+    ));
+    setActiveScenario(kind);
+    setResult(null);
+    setError("");
+    setVerificationOpen(false);
+    setVerificationSessionId("");
+    setCurrentQuestion(null);
+    setAnswer("");
   }
 
   /* =====================================================
@@ -891,13 +940,6 @@ export default function App() {
         recipient_upi_id:
           form.recipient_upi_id.trim(),
 
-        /*
-         * Hidden/internal backend field.
-         * It is NOT shown in the UI.
-         */
-        beneficiary_id:
-          buildInternalBeneficiaryId(),
-
         device:
           form.device.trim() ||
           "UNKNOWN-DEVICE",
@@ -941,11 +983,6 @@ export default function App() {
           }
         );
 
-      console.log(
-        "SecureFlow-AI analyze response:",
-        data
-      );
-
       setResult(
         data || {}
       );
@@ -985,6 +1022,7 @@ export default function App() {
         loadTransactions(
           selectedUserId
         ),
+        loadBehaviourProfile(selectedUserId),
       ]);
     } catch (err) {
       console.error(
@@ -1055,11 +1093,6 @@ export default function App() {
           safeText(questionId);
       }
 
-      console.log(
-        "SecureFlow-AI verification payload:",
-        payload
-      );
-
       const data =
         await apiRequest(
           "/verify-challenge",
@@ -1070,11 +1103,6 @@ export default function App() {
             ),
           }
         );
-
-      console.log(
-        "SecureFlow-AI verification response:",
-        data
-      );
 
       setResult(
         (previous) => ({
@@ -1126,6 +1154,7 @@ export default function App() {
         loadTransactions(
           selectedUserId
         ),
+        loadBehaviourProfile(selectedUserId),
       ]);
     } catch (err) {
       console.error(
@@ -1161,6 +1190,7 @@ export default function App() {
     );
 
     setResult(null);
+    setActiveScenario("");
 
     setError("");
 
@@ -1218,54 +1248,15 @@ export default function App() {
     ) ||
     "PENDING";
 
-  const factors =
-    useMemo(() => {
-      const breakdown =
-        result?.risk_breakdown ??
-        result?.breakdown ??
-        {};
+  const factors = useMemo(() => presentFactors(result), [result]);
 
-      if (
-        !breakdown ||
-        typeof breakdown !==
-          "object"
-      ) {
-        return [];
-      }
-
-      return Object.entries(
-        breakdown
-      )
-        .filter(
-          ([, value]) =>
-            Number.isFinite(
-              Number(value)
-            )
-        )
-        .map(
-          ([name, value]) => ({
-            name,
-            value: clamp(
-              Number(value),
-              0,
-              100
-            ),
-          })
-        )
-        .sort(
-          (a, b) =>
-            b.value - a.value
-        )
-        .slice(0, 9);
-    }, [result]);
-
-  const mlProbability =
-    numberValue(
-      result?.ml_fraud_probability ??
-        result?.fraud_probability ??
-        result?.ml_probability ??
-        0
-    );
+  const engineConnected = health?.api === "OK" && health?.mongodb === "OK";
+  const backendStatus = !health
+    ? "BACKEND OFFLINE"
+    : !engineConnected
+      ? "DATABASE OFFLINE"
+      : "ENGINE CONNECTED";
+  const mlReady = Boolean(health?.ml_metrics?.trained);
 
   const selected =
     selectedUser();
@@ -1371,9 +1362,9 @@ export default function App() {
           </a>
         </nav>
 
-        <div className="header-status">
+        <div className={`header-status ${engineConnected ? "connected" : "disconnected"}`}>
           <span className="status-dot" />
-          SYSTEM ONLINE
+          {backendStatus}
         </div>
 
         <button
@@ -1393,6 +1384,12 @@ export default function App() {
         </button>
       </header>
 
+      <div className="sandbox-banner" role="note">
+        <span className="sandbox-chip">INTERACTIVE SANDBOX</span>
+        <span>Synthetic profiles · Simulated payment attempts · No real funds move</span>
+        <span className="sandbox-backend">{backendStatus} · {mlReady ? "ML MODEL LOADED" : "RULES-ONLY MODE"}</span>
+      </div>
+
       {/* =================================================
           HERO
       ================================================= */}
@@ -1402,8 +1399,8 @@ export default function App() {
           <div className="hero-copy">
             <div className="eyebrow">
               <span />
-              REAL-TIME PAYMENT
-              SECURITY
+              PAYMENT SECURITY
+              SIMULATOR
             </div>
 
             <h1>
@@ -1415,13 +1412,10 @@ export default function App() {
             </h1>
 
             <p>
-              A layered fraud-defence
-              system that observes
-              behaviour, context,
-              devices, locations and
-              transaction history before
-              a payment is allowed to
-              move.
+              Explore how a nine-factor risk engine evaluates
+              amount, behaviour, device, location and recipient
+              context before deciding whether to allow, verify
+              or block a simulated payment.
             </p>
 
             <a
@@ -1467,8 +1461,8 @@ export default function App() {
               </strong>
 
               <small>
-                RULE + MACHINE
-                LEARNING
+                RULES + OPTIONAL
+                TRAINED ML
               </small>
             </div>
           </div>
@@ -1485,7 +1479,7 @@ export default function App() {
           <SectionHeading
             number="01"
             title="TRANSACTION TERMINAL"
-            subtitle="Create a new payment event and send it directly to the live SecureFlow-AI risk engine."
+            subtitle="Build a simulated payment attempt, inspect the decision, and review the evidence. No actual money is transferred."
           />
 
           <div className="terminal-grid">
@@ -1493,8 +1487,30 @@ export default function App() {
               <PanelHeader
                 icon={<WalletCards />}
                 title="PAYMENT INPUT"
-                status="LIVE"
+                status="SANDBOX"
               />
+
+              <div className="scenario-tray">
+                <div className="scenario-tray-heading">
+                  <span>DEMO PLAYBOOK</span>
+                  <small>Fill an example, then click Analyze Payment</small>
+                </div>
+                <div className="scenario-buttons" role="group" aria-label="Payment scenario presets">
+                  <button type="button" className={activeScenario === "everyday" ? "selected" : ""}
+                    onClick={() => applyScenario("everyday")}>
+                    <CheckCircle2 size={15} /> Everyday payment
+                  </button>
+                  <button type="button" className={activeScenario === "new-device" ? "selected" : ""}
+                    onClick={() => applyScenario("new-device")}>
+                    <Smartphone size={15} /> New device
+                  </button>
+                  <button type="button" className={activeScenario === "high-value" ? "selected" : ""}
+                    onClick={() => applyScenario("high-value")}>
+                    <ShieldAlert size={15} /> High-value anomaly
+                  </button>
+                </div>
+                <p>Presets use this profile’s available history. Scores and decisions are always calculated by the backend.</p>
+              </div>
 
               <form
                 onSubmit={
@@ -1957,11 +1973,9 @@ export default function App() {
                       </div>
                     </div>
 
-                    <div className="verified-pill">
-                      <Check
-                        size={13}
-                      />
-                      VERIFIED
+                    <div className="verified-pill demo-pill">
+                      <Database size={13} />
+                      SYNTHETIC PROFILE
                     </div>
                   </div>
                 ) : (
@@ -1976,7 +1990,7 @@ export default function App() {
                   icon={
                     <Activity />
                   }
-                  title="LIVE TELEMETRY"
+                  title="DEMO TELEMETRY"
                 />
 
                 <div className="telemetry-list">
@@ -1999,7 +2013,12 @@ export default function App() {
 
                   <TelemetryRow
                     label="ML STATUS"
-                    value="READY"
+                    value={mlReady ? "MODEL LOADED" : "RULES ONLY"}
+                  />
+
+                  <TelemetryRow
+                    label="DATA SOURCE"
+                    value={engineConnected ? "MONGODB" : "UNAVAILABLE"}
                   />
                 </div>
               </div>
@@ -2055,7 +2074,7 @@ export default function App() {
             <SectionHeading
               number="02"
               title="RISK ANALYSIS"
-              subtitle="The transaction has passed through the live rule, behavioural and machine-learning analysis pipeline."
+              subtitle="A reproducible rule-based result, enhanced by supervised ML only when a trained model is actually loaded."
             />
 
             <div className="risk-grid">
@@ -2172,7 +2191,7 @@ export default function App() {
                             </span>
 
                             <strong>
-                              {factor.value}
+                              {factor.value} / {factor.maximum}
                             </strong>
                           </div>
 
@@ -2181,13 +2200,26 @@ export default function App() {
                               className={`factor-fill ${risk}`}
                               style={{
                                 width: `${clamp(
-                                  factor.value,
+                                  factor.fillPercent,
                                   0,
                                   100
                                 )}%`,
                               }}
                             />
                           </div>
+                          {factor.checks && typeof factor.checks === "object" && (
+                            <details className="factor-details">
+                              <summary>View underlying signals</summary>
+                              <div className="factor-checks">
+                                {Object.entries(factor.checks).map(([key, value]) => (
+                                  <div key={key}>
+                                    <span>{key.replaceAll("_", " ")}</span>
+                                    <strong>{safeText(value, "—")}</strong>
+                                  </div>
+                                ))}
+                              </div>
+                            </details>
+                          )}
                         </div>
                       )
                     )}
@@ -2214,12 +2246,14 @@ export default function App() {
                     </span>
 
                     <strong>
-                      {(
-                        mlProbability *
-                        100
-                      ).toFixed(2)}
-                      %
+                      {formatMlProbability(result)}
                     </strong>
+                    {!mlReady && (
+                      <small className="ml-disclosure">No supervised fraud classifier is active. The displayed decision uses the nine-factor rule engine.</small>
+                    )}
+                    {mlReady && (
+                      <small className="ml-disclosure">Supervised estimate trained on synthetic data; not independently calibrated for real payments.</small>
+                    )}
                   </div>
                 </div>
               </div>

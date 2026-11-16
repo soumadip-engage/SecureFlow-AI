@@ -3,12 +3,15 @@
 Run from backend/:
   python -m ml.train_from_csv --csv /path/to/secureflow_ai_1m_ml_training.csv
 
-Only ground-truth ``is_fraud`` and the predeclared ``dataset_split`` are used.
+Only ground-truth ``is_fraud`` is used as the label. By default, users are
+assigned to disjoint train/validation/test sets via a stable hash of user_id.
 Synthetic risk scores, decisions and fraud-pattern names are NOT model inputs.
+User-ID overlap between holdout splits is reported, not hidden.
 """
 
 import argparse
 import csv
+import hashlib
 import json
 import random
 from datetime import datetime, timezone
@@ -38,26 +41,71 @@ def reservoir_add(items, seen, cap, item, rng):
             items[idx] = item
 
 
-def read_dataset(path, max_normal, max_fraud, seed):
+def build_split_audit(users_by_split):
+    train = users_by_split["train"]
+    validation = users_by_split["validation"]
+    test = users_by_split["test"]
+    overlap_validation = len(train & validation)
+    overlap_test = len(train & test)
+    return {
+        "unique_users": {split: len(users) for split, users in users_by_split.items()},
+        "train_validation_user_overlap": overlap_validation,
+        "train_test_user_overlap": overlap_test,
+        "validation_test_user_overlap": len(validation & test),
+        "caveat": (
+            "The supplied holdout splits reuse user IDs across training and evaluation. "
+            "Metrics may be optimistic for unseen users; use a user-disjoint "
+            "or genuinely prospective holdout before claiming generalization."
+            if overlap_validation or overlap_test
+            else "Training and holdout user IDs are disjoint."
+        ),
+    }
+
+
+def user_disjoint_split(user_id, seed):
+    """A user belongs to one split regardless of source CSV row ordering."""
+    digest = hashlib.sha256(f"{seed}:{user_id}".encode("utf-8")).digest()
+    fraction = int.from_bytes(digest[:8], "big") / (1 << 64)
+    if fraction < 0.70:
+        return "train"
+    if fraction < 0.85:
+        return "validation"
+    return "test"
+
+
+def read_dataset(path, max_normal, max_fraud, seed, split_strategy="user-disjoint"):
+    if split_strategy not in {"provided", "user-disjoint"}:
+        raise ValueError("split_strategy must be provided or user-disjoint")
     rng = random.Random(seed)
     sampled = {0: [], 1: []}
     seen = {0: 0, 1: 0}
     evaluations = {"validation": ([], []), "test": ([], [])}
     counts = {"train": 0, "validation": 0, "test": 0}
+    users_by_split = {"train": set(), "validation": set(), "test": set()}
 
     with open(path, encoding="utf-8-sig", newline="") as source:
         reader = csv.DictReader(source)
-        required = set(FEATURE_NAMES) | {"is_fraud", "dataset_split"}
+        required = set(FEATURE_NAMES) | {"is_fraud", "user_id"}
+        if split_strategy == "provided":
+            required.add("dataset_split")
         missing = sorted(required - set(reader.fieldnames or []))
         if missing:
             raise ValueError(f"CSV is missing ML columns: {', '.join(missing)}")
 
         for row in reader:
-            split = (row["dataset_split"] or "").lower().strip()
+            user_id = (row["user_id"] or "").strip()
+            if not user_id:
+                raise ValueError("Every row must have a user_id for split integrity checks.")
+            split = (
+                user_disjoint_split(user_id, seed)
+                if split_strategy == "user-disjoint"
+                else (row["dataset_split"] or "").lower().strip()
+            )
             label_text = (row["is_fraud"] or "").strip()
             if split not in counts or label_text not in {"0", "1"}:
                 raise ValueError("Each row must have a recognized split and binary is_fraud label.")
             label = int(label_text)
+            users_by_split[split].add(user_id)
             try:
                 features = [float(row[name]) for name in FEATURE_NAMES]
             except (ValueError, TypeError) as exc:
@@ -80,7 +128,9 @@ def read_dataset(path, max_normal, max_fraud, seed):
     for split, (x, y) in evaluations.items():
         if len(x) < 1 or len(set(y)) != 2:
             raise ValueError(f"{split} requires both normal and fraud examples.")
-    return train_data, evaluations, counts
+    audit = build_split_audit(users_by_split)
+    audit["strategy"] = split_strategy
+    return train_data, evaluations, counts, audit
 
 
 def evaluate(classifier, x, y):
@@ -103,10 +153,13 @@ def evaluate(classifier, x, y):
     }
 
 
-def train(path, output, max_normal=50000, max_fraud=10000, trees=120, seed=42):
+def train(path, output, max_normal=50000, max_fraud=10000, trees=120, seed=42,
+          split_strategy="user-disjoint"):
     if max_normal < 10 or max_fraud < 10 or trees < 10:
         raise ValueError("Sampling caps and tree count must each be at least 10.")
-    train_data, evaluations, counts = read_dataset(path, max_normal, max_fraud, seed)
+    train_data, evaluations, counts, split_audit = read_dataset(
+        path, max_normal, max_fraud, seed, split_strategy
+    )
     x_train = [pair[0] for pair in train_data]
     y_train = [pair[1] for pair in train_data]
 
@@ -128,6 +181,7 @@ def train(path, output, max_normal=50000, max_fraud=10000, trees=120, seed=42):
         "train_rows": len(train_data),
         "train_positive_rows": sum(y_train),
         "source_counts": counts,
+        "split_audit": split_audit,
         "validation_metrics": validation,
         "test_metrics": test,
     }
@@ -144,6 +198,14 @@ if __name__ == "__main__":
     parser.add_argument("--max-normal", type=int, default=50000)
     parser.add_argument("--max-fraud", type=int, default=10000)
     parser.add_argument("--trees", type=int, default=120)
+    parser.add_argument(
+        "--split-strategy", choices=["user-disjoint", "provided"],
+        default="user-disjoint",
+        help="Default holds out entire users; 'provided' reuses the CSV's split labels.",
+    )
     args = parser.parse_args()
-    metrics = train(args.csv, args.output, args.max_normal, args.max_fraud, args.trees)
+    metrics = train(
+        args.csv, args.output, args.max_normal, args.max_fraud, args.trees,
+        split_strategy=args.split_strategy,
+    )
     print(json.dumps(metrics, indent=2))

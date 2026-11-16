@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from pymongo.errors import PyMongoError
 
 import main
+from ml.train_from_csv import build_split_audit, user_disjoint_split
 
 
 class SecurityTests(unittest.TestCase):
@@ -72,6 +73,21 @@ class SecurityTests(unittest.TestCase):
 
 
 class RiskAndModelTests(unittest.TestCase):
+    def test_training_split_audit_identifies_reused_user_ids(self):
+        audit = build_split_audit({
+            "train": {"u1", "u2"},
+            "validation": {"u2", "u3"},
+            "test": {"u1", "u4"},
+        })
+        self.assertEqual(audit["train_test_user_overlap"], 1)
+        self.assertEqual(audit["train_validation_user_overlap"], 1)
+        self.assertIn("optimistic", audit["caveat"])
+
+    def test_user_disjoint_split_is_stable_for_every_user(self):
+        assignments = {user_disjoint_split(f"user-{index}", 42) for index in range(500)}
+        self.assertEqual(assignments, {"train", "validation", "test"})
+        self.assertEqual(user_disjoint_split("user-42", 42), user_disjoint_split("user-42", 42))
+
     def test_risk_weights_are_bounded_to_100(self):
         self.assertEqual(sum(main.RISK_WEIGHTS.values()), 100)
 

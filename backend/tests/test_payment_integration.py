@@ -75,6 +75,59 @@ class PaymentFlowTests(unittest.TestCase):
             self.assertEqual(self.database["verification_sessions"].count_documents({}), 1)
             self.assertNotIn("correct_answer", result["verification"]["question"])
 
+    def test_client_supplied_beneficiary_id_does_not_create_trust(self):
+        # The old browser fabricated an internal ID, bypassing unknown-recipient scoring.
+        response = self.client.post("/analyze-payment", json={
+            "user_id": "1",
+            "amount": 100,
+            "recipient_upi_id": "completely-new@demo",
+            "beneficiary_id": "claim-I-am-already-known",
+            "device": "trusted-device",
+            "location_name": "Haldia",
+            "transaction_time": "2026-11-16T12:00:00+00:00",
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertGreaterEqual(response.json()["risk_breakdown"]["beneficiary_risk"], 8)
+        saved = self.database["transactions"].find_one()
+        self.assertIsNone(saved["beneficiary_id"])
+
+    def test_real_beneficiary_record_is_resolved_server_side(self):
+        self.database["synthetic_beneficiaries"].insert_one({
+            "beneficiary_id": 3, "upi_id": "trusted@demo", "trust_score": 80,
+        })
+        resolved = main.resolve_beneficiary("1", "trusted@demo", "invented-id")
+        self.assertTrue(resolved["resolved"])
+        self.assertEqual(resolved["beneficiary_id"], 3)
+
+    def test_operational_history_is_visible_but_only_approved_events_shape_baseline(self):
+        self.database["transactions"].insert_many([
+            {
+                "user_id": 1, "transaction_id": "approved-new",
+                "amount": 120, "status": "ALLOW",
+                "device": "new-trusted-device",
+                "transaction_time": datetime(2026, 11, 14, 12, tzinfo=timezone.utc),
+            },
+            {
+                "user_id": 1, "transaction_id": "blocked-new",
+                "amount": 999999, "status": "BLOCK",
+                "device": "malicious-device",
+                "transaction_time": datetime(2026, 11, 15, 12, tzinfo=timezone.utc),
+            },
+        ])
+
+        baseline = main.get_user_transactions("1")
+        baseline_ids = {record["transaction_id"] for record in baseline}
+        self.assertIn("approved-new", baseline_ids)
+        self.assertNotIn("blocked-new", baseline_ids)
+        self.assertIn("new-trusted-device", main.build_user_profile("1", baseline)["known_devices"])
+
+        visible = self.client.get("/transactions/1")
+        self.assertEqual(visible.status_code, 200)
+        visible_ids = [record["transaction_id"] for record in visible.json()]
+        self.assertIn("blocked-new", visible_ids)
+        self.assertIn("approved-new", visible_ids)
+        self.assertEqual(visible_ids[0], "blocked-new")
+
 
 if __name__ == "__main__":
     unittest.main()

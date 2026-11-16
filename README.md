@@ -271,7 +271,11 @@ Privileged `/admin/*` operations and the report queue submission endpoint requir
 python -m ml.train_from_csv --csv "C:\path\to\secureflow_ai_1m_ml_training.csv"
 ```
 
-The model is saved locally as `backend/models/secureflow_rf.joblib` (ignored by Git). Set `ML_MODEL_PATH=models/secureflow_rf.joblib` in `backend/.env` to load this **trusted, locally trained** artifact at startup. Do not load model files downloaded from unknown sources. The training script uses only the dataset's explicit `is_fraud` labels and provided train/validation/test split; it excludes precomputed risk scores and decisions from model inputs. Validation/test performance remains synthetic-only, not a real-world fraud-detection guarantee.
+The model is saved locally as `backend/models/secureflow_rf.joblib` (ignored by Git). Set `ML_MODEL_PATH=models/secureflow_rf.joblib` in `backend/.env` to load this **trusted, locally trained** artifact at startup. Do not load model files downloaded from unknown sources. The training script uses only explicit `is_fraud` labels, excludes precomputed scores and decisions, and by default assigns **whole user IDs** to disjoint training/validation/test sets with a reproducible hash. Validation/test performance remains synthetic-only, not a real-world fraud-detection guarantee or calibrated real-world fraud probability.
+
+The training output also includes a **user-overlap audit**. The supplied CSV's original split reuses **7,809 of 7,814 test users** in training, which makes an original-split evaluation optimistic for unseen users. The default `--split-strategy user-disjoint` avoids that overlap; pass `--split-strategy provided` only to reproduce the original synthetic split, with its limitation clearly disclosed. Neither evaluation is independent real-world validation. If the supervised model is not explicitly loaded, `/health` and the web UI report **rules-only mode** and no fabricated ML fraud probability.
+
+**Reproducible synthetic benchmark (40-tree demonstration run, seed 42):** the user-disjoint test split contained **148,750 transactions / 310 fraud labels / 1,512 unseen users**. Precision was **89.66%**, recall **83.87%**, and F1 **86.67%** (30 false positives, 50 false negatives). No training users appeared in validation/test. Reproduce with `--trees 40`; these results are **not** independently verified real-world performance and the estimated probabilities have not been calibrated on real payments.
 
 ### 3. Start the frontend
 
@@ -353,17 +357,16 @@ The project uses synthetic/historical data to support behavior baselines and dev
 
 ## Demonstration walkthrough
 
-For a hackathon presentation, the **intended** walkthrough is:
+For a hackathon presentation, the **implemented demo path** is:
 
-1. Register or select a clearly marked test user; complete required profile information.
-2. Start a simulated payment by entering an amount, recipient, and purpose.
-3. Show the context gathered for that attempt and the nine inspector contributions.
-4. Demonstrate an **allow** result from low-risk input signals.
-5. Demonstrate a **hold** result and a relevant verification question from alert-level signals.
-6. Demonstrate a **block** result from high-risk signals.
-7. Inspect the resulting transaction record, security event, incident, and (where triggered) draft report.
+1. Open the web UI and confirm the **Interactive Sandbox** banner and **Engine Connected** status. If MongoDB is offline, fix the connection before demonstrating.
+2. Select a synthetic user. The **Demo Playbook** provides **Everyday payment**, **New device**, and **High-value anomaly** presets. These populate inputs from available user history; they do not preset a decision.
+3. Click **Analyze Payment** and explain the 0–100 score, **nine bounded factor bars** and expandable underlying signals. A factor scored 10/10 now fills its bar completely.
+4. Compare two or three scenarios. The actual result depends on that user's data: the intended **ALLOW / VERIFY / BLOCK** outcomes are calculated, not scripted. When verification is requested, answer the server-selected question and show the new decision.
+5. Scroll to **Transaction History**: the newly analyzed attempt appears alongside synthetic records. Only allowed/monitored operational attempts inform future behavior baselines; blocked and pending attempts remain visible but do not become trusted behavior.
+6. Show `/health` for honest ML/DB status; inspect an incident and draft report if a block triggers them.
 
-Do not claim a step has passed a live test until it has actually been verified in the running application.
+There are no real transfers, certified biometric checks, or automatic government reports. A sample payment can legitimately score high or low depending on the selected user's history. For the recommended stage script see [DEMO_GUIDE.md](DEMO_GUIDE.md).
 
 ## Testing and validation
 
@@ -385,6 +388,7 @@ python -m unittest discover -s tests -v
 cd ..\frontend
 npm ci
 npm run lint
+npm test
 npm run build
 ```
 
@@ -402,6 +406,11 @@ The checks also run in GitHub Actions on pull requests. They exercise security b
 - [x] Add initial backend regression tests, frontend lint/build checks, CI, and Python dependency ranges
 - [x] Protect privileged reset/retrain operations and reject client-supplied biometric proof
 - [x] Support explicit-fraud-label training and offline CSV model evaluation
+- [x] Show honest sandbox/health/ML status and correctly scaled explainable risk contributions
+- [x] Provide selectable demo payment scenarios without hardcoded decisions
+- [x] Prevent client-invented beneficiary IDs from bypassing recipient trust checks
+- [x] Include operational payments in history while excluding blocked/pending attempts from user baselines
+- [x] Audit training/validation/test user overlap and test the new frontend presentation logic
 - [ ] Add authentication and authorization for every user's records and SOC role
 - [ ] Refactor large application files into focused services and components
 - [ ] Harden audit evidence and reporting review/approval workflows
