@@ -5,7 +5,6 @@ import {
   AudioLines,
   Check,
   CheckCircle2,
-  ChevronDown,
   CircleDollarSign,
   Clock3,
   Cpu,
@@ -38,7 +37,9 @@ import {
 
 import "./index.css";
 
-const API = "http://127.0.0.1:8000";
+const API = (
+  import.meta.env.VITE_API_URL || "http://127.0.0.1:8000"
+).replace(/\/+$/, "");
 
 /* =========================================================
    SAFE HELPERS
@@ -218,7 +219,7 @@ async function apiRequest(
       "content-type"
     ) || "";
 
-  let data = null;
+  let data;
 
   if (
     contentType.includes(
@@ -645,45 +646,10 @@ export default function App() {
      LOAD DATA
   ===================================================== */
 
-  async function loadUsers() {
-    const data =
-      await apiRequest(
-        "/users"
-      );
-
-    const list = Array.isArray(
-      data
-    )
-      ? data
-      : Array.isArray(
-          data?.users
-        )
-      ? data.users
-      : [];
-
-    setUsers(list);
-
-    if (list.length > 0) {
-      const first =
-        list[0];
-
-      const id = safeText(
-        first.user_id ??
-          first.id ??
-          first._id
-      );
-
-      setSelectedUserId(
-        id
-      );
-    }
-  }
-
   async function loadTransactions(
     userId
   ) {
     if (!userId) {
-      setTransactions([]);
       return;
     }
 
@@ -735,32 +701,40 @@ export default function App() {
     }
   }
 
-  async function initialize() {
-    setInitialLoading(true);
-
-    try {
-      await Promise.all([
-        loadUsers(),
-        loadDashboard(),
-      ]);
-    } catch (err) {
-      console.error(
-        "Initialization failed:",
-        err
-      );
-
-      setError(
-        getErrorMessage(err)
-      );
-    } finally {
-      setInitialLoading(false);
-    }
-  }
-
   useEffect(() => {
-    initialize();
+    let active = true;
+
+    Promise.allSettled([
+      apiRequest("/users"),
+      apiRequest("/soc/dashboard"),
+    ]).then(([usersResult, dashboardResult]) => {
+      if (!active) return;
+
+      if (usersResult.status === "fulfilled") {
+        const data = usersResult.value;
+        const list = Array.isArray(data)
+          ? data
+          : Array.isArray(data?.users)
+          ? data.users
+          : [];
+        setUsers(list);
+
+        if (list.length > 0) {
+          const first = list[0];
+          setSelectedUserId(safeText(first.user_id ?? first.id ?? first._id));
+        }
+      } else {
+        setError(getErrorMessage(usersResult.reason));
+      }
+
+      if (dashboardResult.status === "fulfilled") {
+        setDashboard(dashboardResult.value);
+      }
+      setInitialLoading(false);
+    });
 
     return () => {
+      active = false;
       try {
         recognitionRef.current?.stop();
       } catch {
@@ -779,11 +753,26 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (selectedUserId) {
-      loadTransactions(
-        selectedUserId
-      );
-    }
+    if (!selectedUserId) return;
+    let active = true;
+
+    apiRequest(`/transactions/${encodeURIComponent(selectedUserId)}`)
+      .then((data) => {
+        if (!active) return;
+        const list = Array.isArray(data)
+          ? data
+          : Array.isArray(data?.transactions)
+          ? data.transactions
+          : [];
+        setTransactions(list);
+      })
+      .catch((err) => {
+        if (!active) return;
+        console.warn("Transaction history could not be loaded:", err);
+        setTransactions([]);
+      });
+
+    return () => { active = false; };
   }, [selectedUserId]);
 
   /* =====================================================
@@ -914,39 +903,32 @@ export default function App() {
           "UNKNOWN-DEVICE",
 
         ip_address:
-          form.ip_address.trim() ||
-          "127.0.0.1",
+          form.ip_address.trim() || null,
 
         ip_location:
-          form.ip_location.trim() ||
-          form.location_name.trim() ||
-          "Kolkata, West Bengal",
+          form.ip_location.trim() || null,
 
         location_name:
-          form.location_name.trim() ||
-          "Kolkata, West Bengal",
+          form.location_name.trim() || null,
 
         latitude:
-          Number(form.latitude) ||
-          0,
+          form.latitude.trim() === ""
+            ? null
+            : Number(form.latitude),
 
         longitude:
-          Number(form.longitude) ||
-          0,
+          form.longitude.trim() === ""
+            ? null
+            : Number(form.longitude),
 
         transaction_time:
-          form.transaction_time ||
-          nowLocalInput(),
+          new Date(form.transaction_time || Date.now()).toISOString(),
 
-        face_verified: true,
+        // This prototype cannot claim a verified identity or face match.
+        face_verified: false,
 
-        identity_verified: true,
+        identity_verified: false,
       };
-
-      console.log(
-        "SecureFlow-AI analyze payload:",
-        payload
-      );
 
       const data =
         await apiRequest(
@@ -1236,13 +1218,13 @@ export default function App() {
     ) ||
     "PENDING";
 
-  const breakdown =
-    result?.risk_breakdown ??
-    result?.breakdown ??
-    {};
-
   const factors =
     useMemo(() => {
+      const breakdown =
+        result?.risk_breakdown ??
+        result?.breakdown ??
+        {};
+
       if (
         !breakdown ||
         typeof breakdown !==
@@ -1275,7 +1257,7 @@ export default function App() {
             b.value - a.value
         )
         .slice(0, 9);
-    }, [breakdown]);
+    }, [result]);
 
   const mlProbability =
     numberValue(
@@ -1895,7 +1877,7 @@ export default function App() {
                       </span>
 
                       <strong>
-                        ENABLED
+                        DEMO MODE — NOT VERIFIED
                       </strong>
                     </div>
                   </div>

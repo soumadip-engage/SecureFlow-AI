@@ -240,7 +240,7 @@ In the first PowerShell terminal:
 cd backend
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install fastapi uvicorn pymongo python-dotenv scikit-learn
+python -m pip install -r requirements.txt
 ```
 
 Create a **local-only** `backend/.env` with values appropriate to your deployment:
@@ -249,6 +249,9 @@ Create a **local-only** `backend/.env` with values appropriate to your deploymen
 MONGODB_URI=your_mongodb_connection_uri
 MONGODB_DB=SecureFlowDB
 AUTO_TRAIN_ML=false
+APP_ENV=development
+ENABLE_DEMO_RESET=false
+ADMIN_API_KEY=
 ```
 
 ```powershell
@@ -258,7 +261,17 @@ python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000
 - API documentation: `http://127.0.0.1:8000/docs`
 - Health endpoint: `http://127.0.0.1:8000/health`
 
-> Dependency versions are not locked in a Python requirements file in the inspected repository. The install line is a starting point; inspect any runtime errors and pin verified versions before a reproducible deployment. If PowerShell blocks venv activation, use `.\.venv\Scripts\python.exe` to run Python without activating the environment.
+The tracked `backend/.env.example` documents the available settings. Python dependencies are specified with bounded version ranges, not a frozen lockfile. If PowerShell blocks activation, use `.\.venv\Scripts\python.exe` instead.
+
+Privileged `/admin/*` operations and the report queue submission endpoint require a strong **server-side** `ADMIN_API_KEY` passed in the `X-Admin-Key` header. When unset, privileged operations are unavailable. Generate a key locally with `python -c "import secrets; print(secrets.token_urlsafe(32))"`; never place it in frontend code. Resetting demo data additionally requires `APP_ENV=development`, `ENABLE_DEMO_RESET=true`, and `X-Confirm-Demo-Reset: reset-operational-data`. Keep it disabled for Atlas-backed shared databases.
+
+**Optional ML training using your 1-million-transaction synthetic CSV:**
+
+```powershell
+python -m ml.train_from_csv --csv "C:\path\to\secureflow_ai_1m_ml_training.csv"
+```
+
+The model is saved locally as `backend/models/secureflow_rf.joblib` (ignored by Git). Set `ML_MODEL_PATH=models/secureflow_rf.joblib` in `backend/.env` to load this **trusted, locally trained** artifact at startup. Do not load model files downloaded from unknown sources. The training script uses only the dataset's explicit `is_fraud` labels and provided train/validation/test split; it excludes precomputed risk scores and decisions from model inputs. Validation/test performance remains synthetic-only, not a real-world fraud-detection guarantee.
 
 ### 3. Start the frontend
 
@@ -271,6 +284,7 @@ npm run dev
 ```
 
 Open the local URL printed by Vite, commonly `http://localhost:5173`. The inspected frontend expects the API at `http://127.0.0.1:8000`; keep that port available unless you update the frontend configuration.
+For separate deployments, copy `frontend/.env.example` to `.env.local` and change `VITE_API_URL`. Vite config is public in the browser; never put credentials there.
 
 ## API reference
 
@@ -315,6 +329,9 @@ The project uses synthetic/historical data to support behavior baselines and dev
 - **Consent:** obtain meaningful permission before collecting camera, precise location, or emergency-contact details. Minimize retention and avoid unnecessary biometric storage.
 - **IP and location:** browser access is limited; a public IP is not an exact physical location. Do not claim precise location or device identity without a reliable, authorized source.
 - **Risk interpretation:** a high score indicates a policy concern, not confirmed fraud or guilt.
+- **ML ground truth:** an `ALLOW`, `HOLD`, or `BLOCK` decision is not a fraud label. Supervised learning requires an explicit `is_fraud`/`fraud_label` field. The rule engine remains authoritative for high-risk blocks; ML cannot downgrade its score.
+- **Identity:** the sample UI and API do not perform verified biometrics. Client-provided face scores and identity flags are never trusted as proof of identity.
+- **Access control:** only privileged admin operations are protected by a server-side admin key so far. End-user authentication, user-level authorization for profile/transaction data, and dedicated SOC roles remain **required before any public or production deployment**. The backend denies user-facing demo APIs when `APP_ENV` is not `development`, until real authentication is implemented. Do not expose development mode publicly or use it with real customer data.
 - **External reporting:** a generated report is a **draft**, not a filed police/cybercrime complaint. Actual submission needs an approved channel, appropriate legal basis, and safeguards against false reports.
 - **Real payments:** the prototype cannot intercept or authorize arbitrary third-party UPI payments.
 
@@ -360,7 +377,18 @@ Before demonstrating or deploying, verify at least the following:
 - **Persistence:** every created attempt and decision has consistent IDs and traceable timestamps.
 - **Reporting:** incident drafts reference real stored evidence and are never marked as submitted without confirmation.
 
-No automated test-suite pass or security certification is claimed in this documentation.
+Run these checks locally before each demonstration:
+
+```powershell
+cd backend
+python -m unittest discover -s tests -v
+cd ..\frontend
+npm ci
+npm run lint
+npm run build
+```
+
+The checks also run in GitHub Actions on pull requests. They exercise security boundaries and important calculations without accessing MongoDB Atlas. They are not a substitute for full integration tests or security certification.
 
 ## Development roadmap
 
@@ -371,7 +399,10 @@ No automated test-suite pass or security certification is claimed in this docume
 - [ ] Test deterministic risk factors and boundary cases
 - [ ] Strengthen user authentication, permissions, consent, and data retention
 - [ ] Verify historical-data migration and per-user behavior baselines
-- [ ] Add automated tests, CI, and pinned Python dependencies
+- [x] Add initial backend regression tests, frontend lint/build checks, CI, and Python dependency ranges
+- [x] Protect privileged reset/retrain operations and reject client-supplied biometric proof
+- [x] Support explicit-fraud-label training and offline CSV model evaluation
+- [ ] Add authentication and authorization for every user's records and SOC role
 - [ ] Refactor large application files into focused services and components
 - [ ] Harden audit evidence and reporting review/approval workflows
 - [ ] Explore authorized bank/PSP integration where legally and technically possible
