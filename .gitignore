@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Node
+node_modules/
+dist/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ML
+*.pkl
+*.joblib
+
+# Logs
+*.log
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Archives
+*.zip
+
+# Firebase credentials
+serviceAccountKey.json
+*service-account*.json
+*firebase-adminsdk*.json
+
+# Additional secrets
+*.pem
+*.key
+
+# Unrelated local files
+Leave Request.txt
+
+# Build output
+build/
+coverage/

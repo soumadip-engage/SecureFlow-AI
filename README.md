@@ -1,3 +1,16 @@
 # SecureFlow-AI
-AI-powered digital payment fraud detection and prevention system featuring real-time transaction monitoring, nine-factor risk analysis, adaptive verification, and automated incident reporting. Built by Team QuantumMinds.
- 
+
+AI-Powered Real-Time Payment Fraud Detection, Prevention and Incident Response System.
+
+## Project
+
+SecureFlow-AI combines:
+
+- Behavioural analysis
+- Rule-based fraud detection
+- Machine learning
+- Adaptive verification
+- Risk scoring
+- Account takeover detection
+- Incident response
+- Real-time security monitoring
