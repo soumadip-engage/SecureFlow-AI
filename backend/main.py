@@ -13,8 +13,9 @@ from difflib import SequenceMatcher
 from typing import Any, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from pymongo import MongoClient, DESCENDING
 from pymongo.errors import PyMongoError
@@ -29,9 +30,13 @@ load_dotenv()
 MONGODB_URI = os.getenv("MONGODB_URI", "").strip()
 MONGODB_DB = os.getenv("MONGODB_DB", "SecureFlowDB").strip()
 
-AUTO_TRAIN_ML = os.getenv("AUTO_TRAIN_ML", "true").lower() == "true"
+AUTO_TRAIN_ML = os.getenv("AUTO_TRAIN_ML", "false").lower() == "true"
 ML_MAX_ROWS = int(os.getenv("ML_MAX_ROWS", "100000"))
 ML_TREES = int(os.getenv("ML_TREES", "180"))
+ML_MODEL_PATH = os.getenv("ML_MODEL_PATH", "").strip()
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
+APP_ENV = os.getenv("APP_ENV", "development").strip().lower()
+ENABLE_DEMO_RESET = os.getenv("ENABLE_DEMO_RESET", "false").lower() == "true"
 
 FRONTEND_ORIGINS = [
     "http://localhost:5173",
@@ -75,6 +80,7 @@ EXCLUDED_FROM_RISK_SOURCE = {
     "synthetic_risk_scores",
     "synthetic_locations",
     "synthetic_incidents",
+    "synthetic_notifications",
 }
 
 
@@ -115,6 +121,7 @@ ML_METRICS: dict[str, Any] = {
     "available": RF_AVAILABLE,
     "trained": False,
     "rows": 0,
+    "labeled_rows": 0,
     "train_rows": 0,
     "test_rows": 0,
     "positive_rows": 0,
@@ -158,7 +165,9 @@ async def lifespan(app: FastAPI):
 
         ensure_indexes()
 
-        if AUTO_TRAIN_ML:
+        if ML_MODEL_PATH:
+            load_trained_model(ML_MODEL_PATH)
+        elif AUTO_TRAIN_ML:
             train_ml_model()
 
     except Exception as exc:
@@ -190,6 +199,19 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def enforce_demo_only_access(request, call_next):
+    # The frontend still selects demo users by ID; real authentication and
+    # object-level authorization are not implemented. Fail closed if somebody
+    # attempts to deploy the prototype as a public production API.
+    if APP_ENV != "development" and request.url.path not in {"/", "/health"}:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "User authentication is required before public deployment."},
+        )
+    return await call_next(request)
+
+
 # ============================================================
 # DATABASE HELPERS
 # ============================================================
@@ -201,6 +223,17 @@ def require_db():
             detail="MongoDB is not connected.",
         )
     return db
+
+
+def require_admin_access(x_admin_key: Optional[str] = Header(default=None)) -> None:
+    """Require a server-side key for privileged demo operations.
+
+    This is not end-user authentication; do not put this key in React code.
+    """
+    if not ADMIN_API_KEY:
+        raise HTTPException(status_code=503, detail="Admin access is not configured.")
+    if not secrets.compare_digest(x_admin_key or "", ADMIN_API_KEY):
+        raise HTTPException(status_code=403, detail="Admin access denied.")
 
 
 def collection_exists(name: str) -> bool:
@@ -249,6 +282,10 @@ def ensure_indexes():
 
         db["incidents"].create_index(
             [("created_at", -1)]
+        )
+
+        db["notifications"].create_index(
+            [("user_id", 1), ("created_at", -1)]
         )
 
         db["reports"].create_index(
@@ -420,6 +457,7 @@ def get_all_users() -> list[dict]:
 def get_user_transactions(
     user_id: Any,
     limit: int = 10000,
+    include_all_operational: bool = False,
 ) -> list[dict]:
 
     collection = get_collection("synthetic_transactions")
@@ -439,7 +477,32 @@ def get_user_transactions(
         .limit(limit)
     )
 
-    return documents
+    # New, successfully processed demo payments can inform future behavior.
+    # Rejected and unverified attempts must not become the user's "normal".
+    if collection_exists("transactions"):
+        operational = list(
+            get_collection("transactions").find(query)
+            .sort("created_at", DESCENDING)
+            .limit(limit)
+        )
+        if not include_all_operational:
+            trusted_outcomes = {
+                "allow", "allowed", "monitor", "monitored", "completed", "success"
+            }
+            operational = [
+                tx for tx in operational
+                if normalize_text(first_value(tx, "status", "decision"))
+                in trusted_outcomes
+            ]
+        documents.extend(operational)
+
+    documents.sort(
+        key=lambda tx: parse_datetime(first_value(
+            tx, "transaction_time", "created_at", "time"
+        )) or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+    return documents[:limit]
 
 
 def get_all_historical_transactions(
@@ -579,14 +642,13 @@ def resolve_beneficiary(
 
     result = {
         "resolved": False,
-        "beneficiary_id": provided_beneficiary_id,
+        "beneficiary_id": None,
         "recipient_upi_id": recipient_upi_id,
         "document": None,
     }
 
-    if provided_beneficiary_id is not None:
-        result["resolved"] = True
-        return result
+    # The client cannot prove recipient trust by inventing an internal ID.
+    # A known beneficiary must be resolved from server-held records/history.
 
     if not recipient_upi_id:
         return result
@@ -1097,6 +1159,16 @@ def device_risk(
 
     current = normalize_text(current_device)
 
+    # An unavailable signal is not evidence of a new or compromised device.
+    if not current or current == "unknown-device":
+        return 0, {
+            "new_unrecognized_device": 0,
+            "device_not_associated": 0,
+            "new_device_unusual_activity": 0,
+            "known_device": False,
+            "signal_available": False,
+        }
+
     known_devices = profile["known_devices"]
 
     is_known = current in known_devices if current else False
@@ -1146,6 +1218,14 @@ def location_risk(
 ) -> tuple[int, dict]:
 
     current_location = normalize_text(location_name)
+
+    if not current_location:
+        return 0, {
+            "new_unrecognized_location": 0,
+            "significantly_different_location": 0,
+            "location_with_unusual_activity": 0,
+            "signal_available": False,
+        }
 
     familiar_locations = {
         normalize_text(value)
@@ -1592,6 +1672,14 @@ def typical_amount_risk(
 # COMPLETE RISK ENGINE
 # ============================================================
 
+def combine_risk_scores(rule_score: float, ml_probability: Optional[float]) -> float:
+    """Allow supervised ML to raise risk without overriding hard rule flags."""
+    if ml_probability is None:
+        return round(max(0.0, min(100.0, rule_score)), 2)
+    blended = rule_score * 0.75 + ml_probability * 0.25
+    return round(max(0.0, min(100.0, max(rule_score, blended))), 2)
+
+
 def calculate_risk(
     user_id: Any,
     amount: float,
@@ -1606,7 +1694,16 @@ def calculate_risk(
     beneficiary_id: Any = None,
 ) -> dict:
 
-    history = get_user_transactions(user_id)
+    # A backdated simulation must not learn from later transactions.
+    history = [
+        tx for tx in get_user_transactions(user_id)
+        if (
+            (timestamp := parse_datetime(first_value(
+                tx, "transaction_time", "created_at", "time"
+            ))) is not None
+            and timestamp < transaction_time
+        )
+    ]
 
     profile = build_user_profile(
         user_id,
@@ -1754,21 +1851,7 @@ def calculate_risk(
         features
     )
 
-    if ml_probability is None:
-        hybrid_score = float(rule_score)
-    else:
-        hybrid_score = (
-            rule_score * 0.75
-            + ml_probability * 0.25
-        )
-
-    hybrid_score = round(
-        max(
-            0,
-            min(100, hybrid_score),
-        ),
-        2,
-    )
+    hybrid_score = combine_risk_scores(rule_score, ml_probability)
 
     if hybrid_score <= 30:
         risk_level = "LOW"
@@ -1878,7 +1961,7 @@ def build_current_ml_features(
         transaction_time,
     )
 
-    hours_since_last = 999.0
+    hours_since_last = 9999.0
 
     if previous:
 
@@ -1930,7 +2013,7 @@ def build_current_ml_features(
         amount_deviation = (
             abs(amount - average_amount)
             / average_amount
-        )
+        ) * 100
 
     known_beneficiary = 0
 
@@ -1954,9 +2037,11 @@ def build_current_ml_features(
 
     known_devices = profile["known_devices"]
 
+    normalized_device = normalize_text(device)
     new_device = int(
-        normalize_text(device)
-        not in known_devices
+        bool(normalized_device)
+        and normalized_device != "unknown-device"
+        and normalized_device not in known_devices
     )
 
     familiar_locations = {
@@ -1967,8 +2052,8 @@ def build_current_ml_features(
     }
 
     unusual_location = int(
-        normalize_text(location_name)
-        not in familiar_locations
+        bool(normalize_text(location_name))
+        and normalize_text(location_name) not in familiar_locations
     )
 
     location_change = 0
@@ -1995,9 +2080,7 @@ def build_current_ml_features(
         not known_beneficiary
     )
 
-    no_previous_transaction = int(
-        not known_beneficiary
-    )
+    no_previous_transaction = int(not history)
 
     typical_amount = 0
 
@@ -2088,36 +2171,53 @@ def feature_vector(features: dict) -> list[float]:
     ]
 
 
-def transaction_label(transaction: dict) -> int:
-    status = normalize_text(
-        transaction.get("status")
-    )
+def transaction_label(transaction: dict) -> Optional[int]:
+    """Return verified/synthetic ground truth, never a payment decision.
 
-    fraud_statuses = {
-        "held",
-        "blocked",
-        "fraud",
-        "declined",
-        "rejected",
-        "suspicious",
+    BLOCK/HOLD/ALLOW are outputs of the current risk policy and do not
+    establish whether an attempt was actually fraudulent. Training on those
+    statuses makes the model learn to imitate the existing rule engine.
+    """
+    for name in ("is_fraud", "fraud_label"):
+        value = transaction.get(name)
+        if isinstance(value, bool):
+            return int(value)
+        if value in (0, 1, "0", "1"):
+            return int(value)
+    return None
+
+
+def load_trained_model(path: str) -> dict:
+    """Load only a trusted artifact produced by our offline training script.
+
+    Joblib uses pickle internally and must never receive untrusted uploads.
+    """
+    global ML_CLASSIFIER, ML_ANOMALY, ML_METRICS
+    from joblib import load
+
+    artifact = load(path)
+    if artifact.get("feature_names") != FEATURE_NAMES:
+        raise ValueError("ML model feature schema does not match the backend.")
+    if not hasattr(artifact.get("classifier"), "predict_proba"):
+        raise ValueError("ML model artifact is missing a supervised classifier.")
+
+    ML_CLASSIFIER = artifact["classifier"]
+    ML_ANOMALY = None
+    ML_METRICS = {
+        **ML_METRICS,
+        "trained": True,
+        "available": True,
+        "source_collection": "offline_csv_training",
+        "model_type": "RandomForestClassifier",
+        "trained_at": artifact.get("trained_at"),
+        "train_rows": artifact.get("train_rows", 0),
+        "positive_rows": artifact.get("train_positive_rows", 0),
+        "validation_metrics": artifact.get("validation_metrics"),
+        "test_metrics": artifact.get("test_metrics"),
+        "split_audit": artifact.get("split_audit"),
+        "error": None,
     }
-
-    legitimate_statuses = {
-        "allowed",
-        "approved",
-        "completed",
-        "success",
-        "successful",
-    }
-
-    if status in fraud_statuses:
-        return 1
-
-    if status in legitimate_statuses:
-        return 0
-
-    # Unknown status is not treated as fraud.
-    return 0
+    return ML_METRICS
 
 
 def train_ml_model() -> dict:
@@ -2168,7 +2268,8 @@ def train_ml_model() -> dict:
             histories[str(user_id)].append(tx)
 
         X = []
-        y = []
+        X_labeled = []
+        y_labeled = []
 
         for tx in transactions:
 
@@ -2314,7 +2415,7 @@ def train_ml_model() -> dict:
                 / avg_amount
                 if avg_amount > 0
                 else 0
-            )
+            ) * 100
 
             count_24h = 0
 
@@ -2357,7 +2458,7 @@ def train_ml_model() -> dict:
                     reverse=True,
                 )[0]
 
-            hours_since_last = 999.0
+            hours_since_last = 9999.0
 
             if previous:
 
@@ -2504,12 +2605,12 @@ def train_ml_model() -> dict:
                 ),
                 "known_beneficiary": known_beneficiary,
                 "new_device": int(
-                    normalize_text(device)
-                    not in known_devices
+                    bool(normalize_text(device))
+                    and normalize_text(device) not in known_devices
                 ),
                 "unusual_location": int(
-                    normalize_text(location)
-                    not in familiar_locations
+                    bool(normalize_text(location))
+                    and normalize_text(location) not in familiar_locations
                 ),
                 "sudden_location_change": (
                     sudden_location_change
@@ -2518,31 +2619,31 @@ def train_ml_model() -> dict:
                     not known_beneficiary
                 ),
                 "no_previous_transaction": int(
-                    not known_beneficiary
+                    not prior_history
                 ),
                 "typical_amount_with_beneficiary": (
                     typical_amount
                 ),
             }
 
-            X.append(
-                feature_vector(features)
-            )
+            vector = feature_vector(features)
+            X.append(vector)
 
-            y.append(
-                transaction_label(tx)
-            )
+            label = transaction_label(tx)
+            if label is not None:
+                X_labeled.append(vector)
+                y_labeled.append(label)
 
         if len(X) < 20:
             raise RuntimeError(
                 "Unable to create enough ML training rows."
             )
 
-        positive_count = sum(y)
+        positive_count = sum(y_labeled)
 
-        if positive_count >= 2 and (
-            len(y) - positive_count
-        ) >= 2:
+        if positive_count >= 10 and (
+            len(y_labeled) - positive_count
+        ) >= 10:
 
             (
                 X_train,
@@ -2550,11 +2651,11 @@ def train_ml_model() -> dict:
                 y_train,
                 y_test,
             ) = train_test_split(
-                X,
-                y,
+                X_labeled,
+                y_labeled,
                 test_size=0.20,
                 random_state=42,
-                stratify=y,
+                stratify=y_labeled,
             )
 
             classifier = RandomForestClassifier(
@@ -2604,11 +2705,12 @@ def train_ml_model() -> dict:
                 "available": True,
                 "trained": True,
                 "rows": len(X),
+                "labeled_rows": len(y_labeled),
                 "train_rows": train_rows,
                 "test_rows": test_rows,
                 "positive_rows": positive_count,
                 "fraud_rate": (
-                    positive_count / len(y)
+                    positive_count / len(y_labeled)
                 ),
                 "roc_auc": auc,
                 "accuracy": float(
@@ -2641,11 +2743,13 @@ def train_ml_model() -> dict:
                 "available": True,
                 "trained": False,
                 "rows": len(X),
+                "labeled_rows": len(y_labeled),
                 "train_rows": 0,
                 "test_rows": 0,
                 "positive_rows": positive_count,
                 "fraud_rate": (
-                    positive_count / len(y)
+                    positive_count / len(y_labeled)
+                    if y_labeled else 0.0
                 ),
                 "roc_auc": None,
                 "accuracy": None,
@@ -2655,8 +2759,8 @@ def train_ml_model() -> dict:
                 "features": FEATURE_NAMES,
                 "trained_at": None,
                 "error": (
-                    "Not enough positive/negative labels "
-                    "for supervised classification."
+                    "Not enough explicit is_fraud/fraud_label "
+                    "ground-truth labels for supervised classification."
                 ),
                 "model_type": (
                     "IsolationForest fallback"
@@ -2687,6 +2791,7 @@ def train_ml_model() -> dict:
             "available": RF_AVAILABLE,
             "trained": False,
             "rows": 0,
+            "labeled_rows": 0,
             "train_rows": 0,
             "test_rows": 0,
             "positive_rows": 0,
@@ -2716,72 +2821,20 @@ def train_ml_model() -> dict:
 def predict_ml_risk(
     features: dict,
 ) -> Optional[float]:
-
-    vector = [
-        feature_vector(features)
-    ]
-
-    probabilities = []
-
-    if ML_CLASSIFIER is not None:
-
-        try:
-
-            probability = float(
-                ML_CLASSIFIER.predict_proba(
-                    vector
-                )[0][1]
-            )
-
-            probabilities.append(
-                probability
-            )
-
-        except Exception:
-            pass
-
-    if ML_ANOMALY is not None:
-
-        try:
-
-            anomaly_score = float(
-                ML_ANOMALY.decision_function(
-                    vector
-                )[0]
-            )
-
-            # Convert anomaly score approximately to
-            # 0-1 risk. More negative = more anomalous.
-            anomaly_risk = max(
-                0.0,
-                min(
-                    1.0,
-                    0.5 - anomaly_score,
-                ),
-            )
-
-            probabilities.append(
-                anomaly_risk
-            )
-
-        except Exception:
-            pass
-
-    if not probabilities:
+    # IsolationForest decision_function is NOT a calibrated fraud probability.
+    # Only a supervised classifier with explicit ground-truth labels may
+    # supply a probability to the hybrid decision score.
+    if ML_CLASSIFIER is None:
         return None
-
-    return round(
-        max(
-            0,
-            min(
-                100,
-                statistics.mean(
-                    probabilities
-                ) * 100,
-            ),
-        ),
-        2,
-    )
+    try:
+        probability = float(
+            ML_CLASSIFIER.predict_proba([feature_vector(features)])[0][1]
+        )
+    except Exception:
+        return None
+    if not math.isfinite(probability):
+        return None
+    return round(max(0.0, min(100.0, probability * 100)), 2)
 
 
 # ============================================================
@@ -2977,11 +3030,6 @@ def get_dynamic_questions(
                     default=1,
                 ),
                 1,
-            ),
-            "answer_explanation": first_value(
-                doc,
-                "answer_explanation",
-                default="Verification response evaluated against stored user context.",
             ),
             "tts_text": question_text,
         })
@@ -3306,12 +3354,8 @@ def create_notification(
     message: str,
     severity: str,
 ):
-    collection_name = "synthetic_notifications"
-
-    if not collection_exists(
-        collection_name
-    ):
-        return
+    # Historical synthetic source collections must remain immutable.
+    collection_name = "notifications"
 
     document = {
         "notification_id": (
@@ -3512,7 +3556,8 @@ class TransactionRequest(BaseModel):
     user_id: str
 
     amount: float = Field(
-        gt=0
+        gt=0,
+        allow_inf_nan=False,
     )
 
     transaction_category: str = "Other"
@@ -3533,9 +3578,9 @@ class TransactionRequest(BaseModel):
 
     location_name: Optional[str] = None
 
-    latitude: Optional[float] = None
+    latitude: Optional[float] = Field(default=None, ge=-90, le=90)
 
-    longitude: Optional[float] = None
+    longitude: Optional[float] = Field(default=None, ge=-180, le=180)
 
     transaction_time: Optional[str] = None
 
@@ -3609,7 +3654,8 @@ def health():
             mongodb_status = "OK"
 
         except Exception as exc:
-            mongodb_error = str(exc)
+            # Do not expose Atlas hostnames or connection details publicly.
+            mongodb_error = "MongoDB connection unavailable"
 
     return {
         "service": "SecureFlow-AI",
@@ -3704,6 +3750,7 @@ def user_transactions(
         for tx in get_user_transactions(
             user_id,
             limit,
+            include_all_operational=True,
         )
     ]
 
@@ -3749,6 +3796,7 @@ def dynamic_question(
         "correct_answer",
         None,
     )
+    question.pop("answer_explanation", None)
 
     return question
 
@@ -4664,42 +4712,15 @@ def verify_identity(
     # point. A real biometric provider can later replace this
     # block.
 
-    if request.face_match_score is None:
-
-        return {
-            "success": False,
-            "status": "BIOMETRIC_ENGINE_NOT_CONFIGURED",
-            "verified": False,
-            "message": (
-                "The consent flow is ready, but a real "
-                "biometric verification engine/reference "
-                "image is not configured."
-            ),
-        }
-
-    score = max(
-        0.0,
-        min(
-            1.0,
-            request.face_match_score,
-        ),
-    )
-
-    verified = score >= 0.80
-
+    # Never trust a score provided by the browser as biometric proof.
+    # Keep the endpoint as a future provider integration boundary.
     return {
-        "success": True,
-        "status": (
-            "VERIFIED"
-            if verified
-            else "FAILED"
-        ),
-        "verified": verified,
-        "match_score": score,
+        "success": False,
+        "status": "BIOMETRIC_ENGINE_NOT_CONFIGURED",
+        "verified": False,
         "message": (
-            "Identity verification successful."
-            if verified
-            else "Identity verification failed."
+            "Biometric verification requires a trusted provider; "
+            "a client-supplied face score cannot verify identity."
         ),
     }
 
@@ -4712,37 +4733,28 @@ def verify_identity(
 def notifications(
     user_id: str,
 ):
-
-    if not collection_exists(
-        "synthetic_notifications"
-    ):
-        return []
-
-    collection = get_collection(
-        "synthetic_notifications"
-    )
-
     variants = id_variants(
         user_id
     )
 
-    documents = list(
-        collection.find({
-            "$or": [
-                {"user_id": value}
-                for value in variants
-            ]
-        })
-        .sort(
-            "created_at",
-            DESCENDING,
-        )
-        .limit(100)
+    documents = []
+    for name in ("notifications", "synthetic_notifications"):
+        if not collection_exists(name):
+            continue
+        documents.extend(list(get_collection(name).find({
+            "$or": [{"user_id": value} for value in variants]
+        }).limit(100)))
+
+    documents.sort(
+        key=lambda doc: parse_datetime(first_value(
+            doc, "created_at", "notification_time", "timestamp"
+        )) or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
     )
 
     return [
         json_safe(doc)
-        for doc in documents
+        for doc in documents[:100]
     ]
 
 
@@ -4851,6 +4863,7 @@ def reports(
 @app.post("/reports/{report_id}/submit")
 def submit_report(
     report_id: str,
+    _admin: None = Depends(require_admin_access),
 ):
 
     collection = get_collection(
@@ -5010,7 +5023,7 @@ def soc_live_feed():
 # ============================================================
 
 @app.get("/admin/data-readiness")
-def data_readiness():
+def data_readiness(_admin: None = Depends(require_admin_access)):
 
     database = require_db()
 
@@ -5087,7 +5100,7 @@ def data_readiness():
 # ============================================================
 
 @app.post("/admin/train-ml")
-def retrain_ml():
+def retrain_ml(_admin: None = Depends(require_admin_access)):
 
     metrics = train_ml_model()
 
@@ -5160,10 +5173,19 @@ def transaction_detail(
 # ============================================================
 
 @app.post("/admin/reset-dashboard")
-def reset_dashboard():
+def reset_dashboard(
+    x_confirm_demo_reset: Optional[str] = Header(default=None),
+    _admin: None = Depends(require_admin_access),
+):
+    # This endpoint is intentionally disabled on any production deployment.
+    if APP_ENV != "development" or not ENABLE_DEMO_RESET:
+        raise HTTPException(status_code=403, detail="Demo reset is disabled.")
+    if x_confirm_demo_reset != "reset-operational-data":
+        raise HTTPException(status_code=400, detail="Reset confirmation is required.")
 
     collections = [
         "transactions",
+        "notifications",
         "verification_sessions",
         "verification_events",
         "incidents",
@@ -5229,6 +5251,7 @@ def get_verification_session(
             "correct_answer",
             None,
         )
+        question.pop("answer_explanation", None)
 
     return {
         "verification_session_id":
@@ -5275,8 +5298,11 @@ async def mongo_exception_handler(
     request,
     exc,
 ):
-    return {
-        "success": False,
-        "error": "MongoDB error",
-        "detail": str(exc),
-    }
+    # Always return a valid Response without leaking connection details.
+    return JSONResponse(
+        status_code=503,
+        content={
+            "success": False,
+            "error": "Database operation unavailable",
+        },
+    )
